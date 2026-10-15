@@ -379,6 +379,11 @@ apply_sections() {
 # отдаёт {}, пока группа URLTest проверяет себя сама. Теги Podkop: <секция>-<N>-out
 health_section() {
 	local sec="$1" i=1
+	# секцию вернули на VPN и т. п.: проверять нечего
+	if [ "$(uci -q get "podkop.$sec.connection_type")" != proxy ]; then
+		rm -f "$RUN_DIR/health_$sec.json"
+		return 1
+	fi
 	total="$(uci -q get "podkop.$sec.urltest_proxy_links" | wc -w)"
 	[ "$total" -gt 0 ] || return 1
 	mkdir -p "$RUN_DIR"

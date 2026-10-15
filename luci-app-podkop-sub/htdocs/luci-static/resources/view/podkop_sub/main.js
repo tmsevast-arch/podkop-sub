@@ -181,7 +181,7 @@ return view.extend({
 			if (!known.length)
 				o.value('', 'нет секций Podkop с типом «Прокси»');
 			known.forEach(function(n) {
-				o.value(n, sections.indexOf(n) < 0 ? n + ' (нет в Podkop)' : n);
+				o.value(n, sections.indexOf(n) < 0 ? n + ' (не прокси или нет в Podkop)' : n);
 			});
 		}
 
