@@ -1,0 +1,15 @@
+{
+	"luci-app-podkop-sub": {
+		"description": "Grant access to podkop-sub",
+		"read": {
+			"uci": [ "podkop_sub", "podkop" ],
+			"file": {
+				"/usr/bin/podkop-sub": [ "exec" ],
+				"/usr/bin/podkop-sub *": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "podkop_sub" ]
+		}
+	}
+}

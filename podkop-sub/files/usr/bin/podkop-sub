@@ -1,0 +1,553 @@
+#!/bin/sh
+# podkop-sub: скачивает подписки и записывает серверы в секции Podkop (urltest_proxy_links)
+#
+#   podkop-sub update [подписка]  обновить все включённые (или одну) и применить к Podkop
+#   podkop-sub update-bg [подп.]  то же в фоне
+#   podkop-sub check              проверить живые серверы, при нехватке обновить
+#   podkop-sub apply              применить ручные ссылки и настройки без загрузки
+#   podkop-sub preview <подписка> показать, что пройдёт фильтры (без записи)
+#   podkop-sub diag <подписка>    диагностика ответа провайдера
+#   podkop-sub status             состояние в JSON (для LuCI)
+#   podkop-sub sections           секции Podkop типа proxy в JSON
+#
+# Коды выхода: 0 ок, 1 ошибка подписки, 2 ошибка конфигурации, 3 уже запущено
+
+. /lib/functions.sh
+
+export LC_ALL=C
+
+CONFIG=podkop_sub
+STATE_DIR=/etc/podkop_sub
+TMP_DIR=/tmp/podkop_sub.$$
+LOCK_DIR=/var/lock/podkop-sub
+RUN_DIR=/var/run/podkop_sub
+EMERGENCY_COOLDOWN=3600
+FILTER=/usr/share/podkop-sub/filter.awk
+TAG=podkop-sub
+
+DEF_PROTOCOLS="vless ss trojan hysteria2 socks"
+DEF_TRANSPORTS="tcp ws grpc"
+DEF_CUT_MARKER="sss.ss"
+DEF_EXCLUDE_HOSTS="0.0.0.0 228.228.228.228"
+DEF_UA="sing-box/1.12.0"
+
+log() {
+	logger -t "$TAG" "$*"
+	echo "$*" >&2
+}
+
+die() {
+	log "$2"
+	exit "$1"
+}
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r\t'
+}
+
+load_settings() {
+	config_load "$CONFIG"
+	config_get UA settings user_agent "$DEF_UA"
+	config_get HWID settings hwid ""
+	config_get MODEL settings device_model ""
+	config_get OS_VER settings os_version ""
+	if [ -z "$MODEL" ]; then
+		# по умолчанию «имя хоста (модель)», чтобы одинаковые роутеры различались у провайдера
+		local host
+		MODEL="$(cat /tmp/sysinfo/model 2>/dev/null)"
+		host="$(uci -q get system.@system[0].hostname)"
+		[ -n "$host" ] && [ "$host" != OpenWrt ] && MODEL="$host${MODEL:+ ($MODEL)}"
+	fi
+	[ -n "$OS_VER" ] || OS_VER="$(. /etc/openwrt_release; echo "${DISTRIB_RELEASE%%.*}")"
+	if [ -z "$HWID" ]; then
+		HWID="$(cat /proc/sys/kernel/random/uuid)"
+		uci -q get "$CONFIG.settings" >/dev/null || uci set "$CONFIG.settings=settings"
+		uci set "$CONFIG.settings.hwid=$HWID"
+		uci commit "$CONFIG"
+		log "создан новый HWID"
+	fi
+	mkdir -p "$STATE_DIR" "$TMP_DIR"
+	trap 'rm -rf "$TMP_DIR"' EXIT
+	trap 'exit 1' INT TERM
+}
+
+# Ищет подписку по id секции или по option name, печатает id
+resolve_sub() {
+	local want="$1" found=""
+	_match() {
+		local name
+		config_get name "$1" name
+		[ "$1" = "$want" ] || [ "$name" = "$want" ] && [ -z "$found" ] && found="$1"
+	}
+	config_foreach _match subscription
+	[ -n "$found" ] && echo "$found"
+}
+
+sub_load() {
+	S_ID="$1"
+	config_get S_NAME "$1" name "$1"
+	config_get S_URL "$1" url ""
+	config_get S_SECTION "$1" section ""
+	config_get S_ENABLED "$1" enabled 1
+	config_get S_PROTOCOLS "$1" protocols "$DEF_PROTOCOLS"
+	config_get S_TRANSPORTS "$1" transports "$DEF_TRANSPORTS"
+	config_get S_CUT "$1" cut_marker "$DEF_CUT_MARKER"
+	config_get S_INC "$1" include_regex ""
+	config_get S_EXC "$1" exclude_regex ""
+	config_get S_HOSTS "$1" exclude_hosts "$DEF_EXCLUDE_HOSTS"
+	config_get S_NO_RU "$1" exclude_russia 0
+	config_get S_MAX_PING "$1" max_ping 0
+}
+
+# Скачивает подписку S_*. Файлы: $F.body $F.hdr. Ставит F_CODE, F_ERR, F_USERINFO
+fetch_sub() {
+	F="$TMP_DIR/$S_ID"
+	F_ERR=""
+	F_USERINFO=""
+	F_CODE="$(curl -sSL --connect-timeout 5 --max-time 15 -A "$UA" \
+		-H "x-hwid: $HWID" -H "x-device-os: OpenWrt" \
+		-H "x-ver-os: $OS_VER" -H "x-device-model: $MODEL" \
+		-D "$F.hdr" -o "$F.body" -w '%{http_code}' "$S_URL" 2>"$F.err")"
+	local rc=$?
+	if [ $rc -ne 0 ]; then
+		F_ERR="ошибка загрузки (curl $rc): $(tail -n 1 "$F.err")"
+		return 1
+	fi
+	F_USERINFO="$(grep -i '^subscription-userinfo:' "$F.hdr" | tail -n 1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//')"
+	if [ "$F_CODE" != 200 ]; then
+		F_ERR="HTTP $F_CODE"
+		return 1
+	fi
+	return 0
+}
+
+# Тело ответа -> ссылки по строкам. 0 ок, 1 JSON (не тот User-Agent)
+decode_body() {
+	local first
+	first="$(tr -d ' \t\r\n' < "$1" | cut -c1)"
+	case "$first" in
+		'{'|'[') return 1 ;;
+	esac
+	if grep -q '://' "$1"; then
+		tr -d '\r' < "$1"
+		return 0
+	fi
+	tr -d ' \t\r\n' < "$1" | tr '_-' '/+' > "$1.b64"
+	local pad=$(( (4 - $(wc -c < "$1.b64") % 4) % 4 ))
+	while [ $pad -gt 0 ]; do printf '=' >> "$1.b64"; pad=$((pad - 1)); done
+	base64 -d < "$1.b64" 2>/dev/null | tr -d '\r'
+	echo
+	return 0
+}
+
+# Время TCP-соединения в мс, пусто если недоступен
+tcp_ping() {
+	local t
+	t="$(curl -sk -o /dev/null --connect-timeout 2 --max-time 3 -w '%{time_connect}' "https://$1:$2/" 2>/dev/null)"
+	awk -v t="$t" 'BEGIN { if (t + 0 > 0) printf "%d", t * 1000 }'
+}
+
+# Фильтрует $F.raw -> $F.tsv (+ $F.stat), применяет max_ping
+filter_sub() {
+	awk -v protocols="$S_PROTOCOLS" -v transports="$S_TRANSPORTS" -v hosts="$S_HOSTS" \
+		-v cut="$S_CUT" -v inc="$S_INC" -v exc="$S_EXC" -v no_ru="$S_NO_RU" \
+		-v statfile="$F.stat" -f "$FILTER" < "$F.raw" > "$F.tsv"
+
+	[ "$S_MAX_PING" -gt 0 ] 2>/dev/null || return 0
+
+	local st reason proto tr host port name link ms kept=0 n=0 tab
+	tab="$(printf '\t')"
+	# замеры параллельно, чтобы уложиться в таймаут веб-интерфейса
+	while IFS="$tab" read -r st reason proto tr host port name link; do
+		n=$((n + 1))
+		[ "$st" = "+" ] && [ "$proto" != hysteria2 ] && [ "$port" != - ] &&
+			tcp_ping "$host" "$port" > "$F.ping.$n" &
+	done < "$F.tsv"
+	wait
+
+	n=0
+	: > "$F.tsv2"
+	while IFS="$tab" read -r st reason proto tr host port name link; do
+		n=$((n + 1))
+		if [ -f "$F.ping.$n" ]; then
+			ms="$(cat "$F.ping.$n")"
+			if [ -z "$ms" ]; then
+				st="-"; reason="unreachable"
+			elif [ "$ms" -gt "$S_MAX_PING" ]; then
+				st="-"; reason="ping ${ms}ms"
+			else
+				reason="${ms}ms"
+			fi
+		fi
+		[ "$st" = "+" ] && kept=$((kept + 1))
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$st" "$reason" "$proto" "$tr" "$host" "$port" "$name" "$link" >> "$F.tsv2"
+	done < "$F.tsv"
+	mv "$F.tsv2" "$F.tsv"
+	sed -i "s/^kept=.*/kept=$kept/" "$F.stat"
+}
+
+# Полный цикл для одной подписки: скачать, раскодировать, отфильтровать.
+# Ставит R_ERR, R_TOTAL, R_STUBS, R_KEPT. Ссылки в $F.links
+run_sub() {
+	R_ERR=""; R_TOTAL=0; R_STUBS=0; R_KEPT=0
+	[ -n "$S_URL" ] || { R_ERR="не указан URL"; return 1; }
+	fetch_sub || { R_ERR="$F_ERR"; return 1; }
+	decode_body "$F.body" > "$F.raw" || { R_ERR="провайдер вернул JSON: смените User-Agent на sing-box/..."; return 1; }
+	filter_sub
+	local total stubs kept
+	. "$F.stat"
+	R_TOTAL=$total; R_STUBS=$stubs; R_KEPT=$kept
+	awk -F '\t' '$1 == "+" { print $8 }' "$F.tsv" > "$F.links"
+	if [ "$R_TOTAL" -eq 0 ]; then
+		R_ERR="в ответе нет ссылок (неизвестный формат)"
+	elif [ "$R_KEPT" -eq 0 ] && [ "$R_STUBS" -gt 0 ] && [ "$R_STUBS" -ge $((R_TOTAL - 1)) ]; then
+		R_ERR="только заглушки: лимит устройств у провайдера или неверный HWID/User-Agent"
+	elif [ "$R_KEPT" -eq 0 ]; then
+		R_ERR="фильтры отсеяли все серверы"
+	fi
+	[ -z "$R_ERR" ]
+}
+
+save_state() {
+	local ok=1
+	[ -n "$R_ERR" ] && ok=0
+	printf '{"name":"%s","time":%d,"ok":%d,"error":"%s","http":"%s","total":%d,"stubs":%d,"kept":%d,"userinfo":"%s"}\n' \
+		"$(json_escape "$S_NAME")" "$(date +%s)" "$ok" "$(json_escape "$R_ERR")" "$F_CODE" \
+		"$R_TOTAL" "$R_STUBS" "$R_KEPT" "$(json_escape "$F_USERINFO")" > "$STATE_DIR/state_$S_ID.json"
+}
+
+lock_acquire() {
+	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+		local pid
+		pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+		[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && die 3 "обновление уже запущено (pid $pid)"
+		rm -rf "$LOCK_DIR"
+		mkdir "$LOCK_DIR" || die 3 "не удалось взять блокировку"
+	fi
+	echo $$ > "$LOCK_DIR/pid"
+	trap 'rm -rf "$LOCK_DIR" "$TMP_DIR"' EXIT
+}
+
+# Собирает итоговый список секции: последние удачные списки подписок + ручные ссылки
+build_section() {
+	local sec="$1" out="$2"
+	: > "$out"
+	_add_sub() {
+		local s en
+		config_get s "$1" section
+		config_get en "$1" enabled 1
+		[ "$s" = "$sec" ] && [ "$en" = 1 ] && cat "$STATE_DIR/sub_$1.links" >> "$out" 2>/dev/null
+	}
+	_add_link() { echo "$1" >> "$out"; }
+	_add_manual() {
+		local s
+		config_get s "$1" section
+		[ "$s" = "$sec" ] && config_list_foreach "$1" link _add_link
+	}
+	config_foreach _add_sub subscription
+	config_foreach _add_manual manual
+	awk '{ k = $0; sub(/#.*/, "", k) } k != "" && !seen[k]++' "$out" > "$out.u"
+	mv "$out.u" "$out"
+}
+
+# Записывает список в podkop.<sec>, если он изменился. 0 изменено, 1 без изменений/ошибка
+apply_section() {
+	local sec="$1" list="$TMP_DIR/sec_$1" cur="$TMP_DIR/cur_$1" ctype
+	ctype="$(uci -q get "podkop.$sec.connection_type")"
+	if [ "$ctype" != proxy ]; then
+		log "секция podkop.$sec не найдена или не proxy (connection_type=$ctype), пропуск"
+		return 1
+	fi
+	build_section "$sec" "$list"
+	if [ ! -s "$list" ]; then
+		log "секция $sec: нет ни одной ссылки, оставляю как есть"
+		return 1
+	fi
+	: > "$cur"
+	_cur_link() { echo "$1" >> "$cur"; }
+	config_load podkop
+	config_list_foreach "$sec" urltest_proxy_links _cur_link
+	config_load "$CONFIG"
+	# сравниваем по существу: порядок и названия (#...) не важны, иначе лишний перезапуск
+	if [ "$(sed 's/#.*//' "$list" | sort)" = "$(sed 's/#.*//' "$cur" | sort)" ] &&
+		[ "$(uci -q get "podkop.$sec.proxy_config_type")" = urltest ]; then
+		log "секция $sec: без изменений ($(wc -l < "$list") серверов)"
+		return 1
+	fi
+	uci set "podkop.$sec.proxy_config_type=urltest"
+	uci -q delete "podkop.$sec.urltest_proxy_links"
+	local l
+	while read -r l; do
+		uci add_list "podkop.$sec.urltest_proxy_links=$l"
+	done < "$list"
+	log "секция $sec: записано $(wc -l < "$list") серверов"
+	return 0
+}
+
+restart_podkop() {
+	uci commit podkop
+	# reload пересобирает конфиг sing-box без перенастройки dnsmasq и загрузки списков
+	log "перезагрузка Podkop"
+	/usr/bin/podkop reload >/dev/null 2>&1 || /etc/init.d/podkop restart >/dev/null 2>&1
+	local i=0
+	while [ $i -lt 15 ]; do
+		pidof sing-box >/dev/null && { log "sing-box запущен"; return 0; }
+		sleep 1; i=$((i + 1))
+	done
+	log "ВНИМАНИЕ: sing-box не запустился после перезапуска Podkop, смотрите logread"
+	return 1
+}
+
+cmd_update() {
+	lock_acquire
+	local only="" ids=""
+	if [ -n "$1" ]; then
+		only="$(resolve_sub "$1")" || die 2 "подписка '$1' не найдена"
+	fi
+	_collect() {
+		local en
+		config_get en "$1" enabled 1
+		[ -n "$only" ] && [ "$1" != "$only" ] && return
+		[ -z "$only" ] && [ "$en" != 1 ] && return
+		ids="$ids $1"
+	}
+	config_foreach _collect subscription
+	[ -n "$ids" ] || die 2 "нет включённых подписок"
+	do_update "$ids"
+}
+
+# Скачивает подписки из списка id и применяет изменившиеся секции
+do_update() {
+	local id sections="" failed=0
+	for id in $1; do
+		sub_load "$id"
+		if [ -z "$S_SECTION" ]; then
+			R_ERR="не выбрана секция Podkop"; F_CODE=""; F_USERINFO=""; R_TOTAL=0; R_STUBS=0; R_KEPT=0
+		elif run_sub; then
+			cp "$F.links" "$STATE_DIR/sub_$id.links"
+			log "$S_NAME: $R_KEPT из $R_TOTAL серверов"
+		fi
+		if [ -n "$R_ERR" ]; then
+			failed=1
+			log "$S_NAME: $R_ERR (остаётся прошлый список)"
+		fi
+		save_state
+		[ -n "$S_SECTION" ] && case " $sections " in
+			*" $S_SECTION "*) ;;
+			*) sections="$sections $S_SECTION" ;;
+		esac
+	done
+
+	date +%s > "$STATE_DIR/last_run"
+	apply_sections "$sections" || failed=1
+	return $failed
+}
+
+# Записывает изменившиеся секции, один раз перезагружает Podkop и сразу
+# проверяет их серверы, чтобы в статусе не висело число живых от старого списка
+apply_sections() {
+	local sec changed="" alive total
+	for sec in $1; do
+		apply_section "$sec" && changed="$changed $sec"
+	done
+	[ -n "$changed" ] || return 0
+	restart_podkop || return 1
+	sleep 3
+	for sec in $changed; do
+		health_section "$sec" && log "секция $sec: живых $alive из $total"
+	done
+	return 0
+}
+
+# Проверяет каждый сервер секции через Clash API, параллельно. Ставит alive и total,
+# пишет $RUN_DIR/health_<секция>.json. Групповой get_group_latency не подходит:
+# отдаёт {}, пока группа URLTest проверяет себя сама. Теги Podkop: <секция>-<N>-out
+health_section() {
+	local sec="$1" i=1
+	total="$(uci -q get "podkop.$sec.urltest_proxy_links" | wc -w)"
+	[ "$total" -gt 0 ] || return 1
+	mkdir -p "$RUN_DIR"
+	rm -f "$TMP_DIR"/alive.*
+	while [ $i -le "$total" ]; do
+		/usr/bin/podkop clash_api get_proxy_latency "$sec-$i-out" 5000 2>/dev/null |
+			grep -qE '"delay"[[:space:]]*:[[:space:]]*[1-9]' && touch "$TMP_DIR/alive.$i" &
+		i=$((i + 1))
+	done
+	wait
+	alive="$(ls "$TMP_DIR" | grep -c '^alive\.')"
+	printf '{"time":%d,"alive":%d,"total":%d}\n' "$(date +%s)" "$alive" "$total" > "$RUN_DIR/health_$sec.json"
+}
+
+# Пересобрать секции из уже скачанных списков и ручных ссылок, без загрузки
+# (после «Применить» в LuCI)
+cmd_apply() {
+	lock_acquire
+	local sections=""
+	_apply_sec() {
+		local s en
+		config_get s "$1" section
+		config_get en "$1" enabled 1
+		[ -n "$s" ] && [ "$en" = 1 ] || return
+		case " $sections " in *" $s "*) ;; *) sections="$sections $s" ;; esac
+	}
+	config_foreach _apply_sec subscription
+	config_foreach _apply_sec manual
+	apply_sections "$sections"
+}
+
+# Проверка живых серверов через Clash API sing-box. Если в секции живых меньше
+# min_alive, внепланово обновляет её подписки (не чаще раза в EMERGENCY_COOLDOWN)
+cmd_check() {
+	lock_acquire
+	pidof sing-box >/dev/null || { log "проверка: sing-box не запущен, пропуск"; return 0; }
+
+	local min sections="" bad="" sec alive total
+	config_get min settings min_alive 1
+	_sec() {
+		local s en
+		config_get s "$1" section
+		config_get en "$1" enabled 1
+		[ -n "$s" ] && [ "$en" = 1 ] || return
+		case " $sections " in *" $s "*) ;; *) sections="$sections $s" ;; esac
+	}
+	config_foreach _sec subscription
+
+	for sec in $sections; do
+		health_section "$sec" || continue
+		if [ "$alive" -lt "$min" ]; then
+			log "проверка $sec: живых $alive из $total (порог $min)"
+			bad="$bad $sec"
+		fi
+	done
+	[ -n "$bad" ] || return 0
+
+	local last now
+	last="$(cat "$RUN_DIR/last_emergency" 2>/dev/null)"
+	now="$(date +%s)"
+	if [ -n "$last" ] && [ $((now - last)) -lt $EMERGENCY_COOLDOWN ]; then
+		log "внеплановое обновление было недавно, жду"
+		return 0
+	fi
+	echo "$now" > "$RUN_DIR/last_emergency"
+
+	local ids=""
+	_bad_ids() {
+		local s en
+		config_get s "$1" section
+		config_get en "$1" enabled 1
+		[ "$en" = 1 ] && case " $bad " in *" $s "*) ids="$ids $1" ;; esac
+	}
+	config_foreach _bad_ids subscription
+	log "внеплановое обновление:$bad"
+	do_update "$ids"
+}
+
+cmd_preview() {
+	local id
+	id="$(resolve_sub "$1")" || die 2 "подписка '$1' не найдена"
+	sub_load "$id"
+	run_sub
+	echo "Всего: $R_TOTAL, заглушек: $R_STUBS, проходит фильтры: $R_KEPT"
+	[ -n "$R_ERR" ] && echo "Ошибка: $R_ERR"
+	[ -f "$F.tsv" ] && awk -F '\t' '{ printf "%s %-12s %-9s %-6s %s:%s  %s\n", $1, $2, $3, $4, $5, $6, $7 }' "$F.tsv"
+	[ -z "$R_ERR" ]
+}
+
+cmd_diag() {
+	local id
+	id="$(resolve_sub "$1")" || die 2 "подписка '$1' не найдена"
+	sub_load "$id"
+	echo "Подписка:   $S_NAME ($S_ID) -> podkop.$S_SECTION"
+	echo "URL:        $(echo "$S_URL" | sed -E 's#^(https?://[^/]*/.{4}).*#\1…#')"
+	echo "HWID:       $HWID"
+	echo "User-Agent: $UA, OS: OpenWrt $OS_VER, модель: $MODEL"
+	fetch_sub
+	echo "HTTP:       $F_CODE ${F_ERR:+($F_ERR)}"
+	[ -f "$F.hdr" ] || return 1
+	echo "Тип:        $(grep -i '^content-type:' "$F.hdr" | tail -n 1 | cut -d: -f2- | tr -d '\r')"
+	echo "Userinfo:   ${F_USERINFO:-нет}"
+	echo "Размер:     $(wc -c < "$F.body") байт"
+	if decode_body "$F.body" > "$F.raw"; then
+		echo "Формат:     $(grep -q '://' "$F.body" && echo 'текст' || echo 'base64'), строк со ссылками: $(grep -c '://' "$F.raw")"
+		echo "Первые строки (UUID скрыты):"
+		grep '://' "$F.raw" | head -n 5 | sed 's#://[^@]*@#://***@#' | cut -c1-120
+	else
+		echo "Формат:     JSON — провайдер не узнал клиента, нужен User-Agent sing-box/..."
+		return 1
+	fi
+	run_sub
+	echo "Итог:       всего $R_TOTAL, заглушек $R_STUBS, проходит $R_KEPT"
+	[ -n "$R_ERR" ] && echo "Вывод:      $R_ERR"
+	[ -z "$R_ERR" ]
+}
+
+cmd_status() {
+	local first=1 last
+	last="$(cat "$STATE_DIR/last_run" 2>/dev/null)"
+	printf '{"last_run":%d,"hwid":"%s","running":%s,"subs":{' "${last:-0}" "$(json_escape "$HWID")" \
+		"$([ -d "$LOCK_DIR" ] && echo true || echo false)"
+	_st() {
+		[ -f "$STATE_DIR/state_$1.json" ] || return
+		[ $first = 1 ] || printf ','
+		first=0
+		printf '"%s":%s' "$1" "$(cat "$STATE_DIR/state_$1.json")"
+	}
+	config_foreach _st subscription
+	printf '},"health":{'
+	first=1
+	local f
+	for f in "$RUN_DIR"/health_*.json; do
+		[ -f "$f" ] || continue
+		[ $first = 1 ] || printf ','
+		first=0
+		f="${f##*/health_}"
+		printf '"%s":%s' "${f%.json}" "$(cat "$RUN_DIR/health_$f")"
+	done
+	# текущее число ссылок в секциях Podkop (у LuCI в кэше значение на момент открытия страницы)
+	printf '},"links":{'
+	first=1
+	local secs="" s
+	_links_sec() {
+		config_get s "$1" section
+		[ -n "$s" ] && case " $secs " in *" $s "*) ;; *) secs="$secs $s" ;; esac
+	}
+	config_foreach _links_sec subscription
+	for s in $secs; do
+		[ $first = 1 ] || printf ','
+		first=0
+		printf '"%s":%d' "$s" "$(uci -q get "podkop.$s.urltest_proxy_links" | wc -w)"
+	done
+	printf '},"sing_box":%s}\n' "$(pidof sing-box >/dev/null && echo true || echo false)"
+}
+
+cmd_sections() {
+	local first=1 s
+	printf '['
+	for s in $(uci -q show podkop | sed -n "s/^podkop\.\([^.=]*\)\.connection_type='proxy'$/\1/p"); do
+		[ $first = 1 ] || printf ','
+		first=0
+		printf '"%s"' "$s"
+	done
+	printf ']\n'
+}
+
+load_settings
+
+case "$1" in
+	update) cmd_update "$2" ;;
+	check) cmd_check ;;
+	apply) cmd_apply ;;
+	update-bg)
+		# для LuCI: запрос не ждёт окончания обновления
+		"$0" update "$2" </dev/null >/dev/null 2>&1 &
+		exit 0
+		;;
+	preview) [ -n "$2" ] || die 2 "укажите подписку"; cmd_preview "$2" ;;
+	diag) [ -n "$2" ] || die 2 "укажите подписку"; cmd_diag "$2" ;;
+	status) cmd_status ;;
+	sections) cmd_sections ;;
+	*)
+		sed -n '2,13s/^# \{0,1\}//p' "$0"
+		exit 2
+		;;
+esac

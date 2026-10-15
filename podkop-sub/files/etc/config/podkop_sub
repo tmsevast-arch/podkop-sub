@@ -1,0 +1,17 @@
+config settings 'settings'
+	option enabled '1'
+	option update_hour '4'
+	option check_interval '10'
+	option min_alive '1'
+	option user_agent 'sing-box/1.12.0'
+
+# Пример подписки (настраивается в LuCI: Службы -> Podkop: подписки)
+#config subscription
+#	option name 'provider'
+#	option enabled '1'
+#	option url 'https://sub.example.com/<TOKEN>'
+#	option section 'VLESS'
+#	list protocols 'vless'
+#	list transports 'tcp'
+#	option exclude_russia '1'
+#	option max_ping '0'
