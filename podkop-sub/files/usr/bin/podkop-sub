@@ -258,6 +258,21 @@ apply_section() {
 		log "секция podkop.$sec не найдена или не proxy (connection_type=$ctype), пропуск"
 		return 1
 	fi
+	# у секции есть подписки, но ни одна ещё не скачалась: не затираем список ручными ссылками
+	local subs=0 cached=0
+	_cnt() {
+		local s en
+		config_get s "$1" section
+		config_get en "$1" enabled 1
+		[ "$s" = "$sec" ] && [ "$en" = 1 ] || return
+		subs=$((subs + 1))
+		[ -s "$STATE_DIR/sub_$1.links" ] && cached=$((cached + 1))
+	}
+	config_foreach _cnt subscription
+	if [ $subs -gt 0 ] && [ $cached = 0 ]; then
+		log "секция $sec: подписки ещё не скачаны, оставляю как есть"
+		return 1
+	fi
 	build_section "$sec" "$list"
 	if [ ! -s "$list" ]; then
 		log "секция $sec: нет ни одной ссылки, оставляю как есть"
@@ -382,16 +397,29 @@ health_section() {
 # (после «Применить» в LuCI)
 cmd_apply() {
 	lock_acquire
-	local sections=""
+	local sections="" missing="" ids="" f id
 	_apply_sec() {
 		local s en
 		config_get s "$1" section
 		config_get en "$1" enabled 1
 		[ -n "$s" ] && [ "$en" = 1 ] || return
 		case " $sections " in *" $s "*) ;; *) sections="$sections $s" ;; esac
+		[ "$2" = subscription ] && [ ! -f "$STATE_DIR/sub_$1.links" ] && missing="$missing $1"
 	}
-	config_foreach _apply_sec subscription
-	config_foreach _apply_sec manual
+	_all_ids() { ids="$ids $1"; }
+	config_foreach _apply_sec subscription subscription
+	config_foreach _apply_sec manual manual
+	config_foreach _all_ids subscription
+
+	# кэш удалённых подписок
+	for f in "$STATE_DIR"/sub_*.links "$STATE_DIR"/state_*.json; do
+		[ -f "$f" ] || continue
+		id="${f##*/}"; id="${id#sub_}"; id="${id#state_}"; id="${id%.links}"; id="${id%.json}"
+		case " $ids " in *" $id "*) ;; *) rm -f "$f" ;; esac
+	done
+
+	# новые подписки ещё ни разу не скачаны: скачать, иначе в секции останутся только ручные ссылки
+	[ -n "$missing" ] && do_update "$missing"
 	apply_sections "$sections"
 }
 

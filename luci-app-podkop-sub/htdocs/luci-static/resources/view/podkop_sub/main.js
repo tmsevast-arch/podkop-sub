@@ -74,9 +74,23 @@ function showOutput(title, res) {
 	]);
 }
 
+// Скрипт на роутере видит только применённый конфиг: несохранённые или
+// неприменённые правки подписки он не увидит
 function runModal(title, args) {
-	ui.showModal(title, [ E('p', { 'class': 'spinning' }, [ 'Запрос к провайдеру…' ]) ]);
-	return run(args).then(function(res) { showOutput(title, res); });
+	return uci.changes().then(function(changes) {
+		var local = [ 'creates', 'changes', 'deletes' ].some(function(k) {
+			return Object.keys(uci.state[k].podkop_sub || {}).length > 0;
+		});
+		if (local || (changes && changes.podkop_sub && changes.podkop_sub.length)) {
+			ui.showModal(title, [
+				E('p', {}, [ 'Есть неприменённые изменения. Нажмите «Сохранить» в окне подписки и «Применить» внизу страницы, затем повторите проверку.' ]),
+				E('div', { 'class': 'right' }, [ E('button', { 'class': 'btn', 'click': ui.hideModal }, [ 'Закрыть' ]) ])
+			]);
+			return;
+		}
+		ui.showModal(title, [ E('p', { 'class': 'spinning' }, [ 'Запрос к провайдеру…' ]) ]);
+		return run(args).then(function(res) { showOutput(title, res); });
+	});
 }
 
 return view.extend({
